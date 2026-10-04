@@ -16,6 +16,8 @@
     "reconcile.d.ts",
     "runtime.js",
     "runtime.d.ts",
+    "startup.js",
+    "startup.d.ts",
     "tree.js",
     "tree.d.ts"
   ],
@@ -23,6 +25,9 @@
   "exports": {
     ".": {
       "default": "./index.js"
+    },
+    "./startup": {
+      "default": "./startup.js"
     }
   },
   "dependencies": {
@@ -50,6 +55,7 @@
     "build": "tsc",
     "format": "prettier --write src benchmark scripts .github/funding.yml .github/workflows package.json README.md",
     "test": "node index.test.js",
+    "test:startup": "node startup.test.js",
     "benchmark": "node benchmark/bench.mjs",
     "test:bun1": "bun index.test.js",
     "test:vms": "node scripts/test-vms.mjs"

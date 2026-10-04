@@ -198,6 +198,27 @@ chokidar.watch('dir-or-file', {
 | `error`                   | `(error)`                                                          |
 | `raw`                     | `(event, path, details)` from the backend; unstable, use with care |
 
+### Startup adapter
+
+`chokidar/startup` exports an opt-in adapter that collects the initial scan into a
+baseline, publishes it exactly once at `ready`, and only then streams incremental events:
+
+```js
+import { watchStartup } from 'chokidar/startup';
+
+const startup = watchStartup('dir');
+startup.on('baseline', (entries) => console.log('initial state', entries));
+startup.on('change', (path) => console.log('incremental change', path));
+startup.on('error', console.error);
+```
+
+Events before `ready` are merged per path into the baseline; events after `ready` are
+increments, with a strict barrier so nothing is delivered twice. The buffer is capped
+(`maxBufferedPaths`); overflow, a source error before `ready`, or an early `close()` fails
+startup without publishing a partial baseline. See
+[docs/startup-adapter.md](docs/startup-adapter.md) for the startup states and failure
+rules.
+
 ## Troubleshooting
 
 - **`ENOSPC: System limit for number of file watchers reached`** (Linux): the inotify watch limit

@@ -12,6 +12,12 @@
 
 ### API changes
 
+- Added the `chokidar/startup` startup adapter: collects the initial scan into a baseline,
+  publishes it exactly once at `ready`, then streams incremental events. Same-path events
+  during the scan merge into the final baseline state, a strict queue barrier keeps
+  baseline and increments disjoint, and the buffer is capped — overflow, a source error
+  before `ready`, or an early `close()` fails startup without publishing a partial
+  baseline. Normal watcher behavior is unchanged.
 - Added the `backend` option: `'auto'` (default), `'native'`, `'native-recursive'`, or `'polling'`.
   - `usePolling: true` remains as a deprecated alias for `backend: 'polling'`.
 - Renamed `interval` and `binaryInterval` to `pollingInterval` and `pollingBinaryInterval`.
