@@ -123,9 +123,16 @@ type BasicOptions = {
   depth?: number;
   ignorePermissionErrors: boolean;
   atomic: boolean | number;
+  /** Collect pre-ready adds as one baseline published at `ready`. */
+  baseline: boolean;
+  /** Max distinct paths held in the startup baseline buffer. */
+  baselineLimit: number;
 };
 export type ChokidarOptions = Partial<
-  BasicOptions & { ignored: Matcher | Matcher[]; awaitWriteFinish: boolean | Partial<AWF> }
+  BasicOptions & {
+    ignored: Matcher | Matcher[];
+    awaitWriteFinish: boolean | Partial<AWF>;
+  }
 >;
 export type FSWInstanceOptions = BasicOptions & {
   ignored: readonly Matcher[];

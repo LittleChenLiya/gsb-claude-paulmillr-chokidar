@@ -35,6 +35,7 @@ import {
   WatchHelper,
 } from './runtime.js';
 import { LifecycleScope, ReconciliationQueue, TreeState, type WatcherContext } from './tree.js';
+import { StartupAdapter, DEFAULT_BASELINE_LIMIT } from './startup.js';
 
 export type {
   AWF,
@@ -114,6 +115,11 @@ function validateOptions(opts: FSWInstanceOptions): void {
       opts.awaitWriteFinish.stabilityThreshold
     );
   }
+  if (opts.baselineLimit !== undefined) {
+    if (!Number.isSafeInteger(opts.baselineLimit) || opts.baselineLimit <= 0) {
+      throw new TypeError('baselineLimit must be a positive safe integer');
+    }
+  }
 }
 
 export interface FSWatcherEventMap {
@@ -162,6 +168,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
   private readyEmitted: boolean;
   private readyPending: boolean;
   private readyScheduled: boolean;
+  private startup?: StartupAdapter;
   private handler: ObservationEngine;
   private scheduler: Scheduler;
 
@@ -207,6 +214,8 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       backendCapabilities: undefined as never,
       // useAsync: false,
       atomic: _opts.atomic ?? true,
+      baseline: _opts.baseline ?? false,
+      baselineLimit: _opts.baselineLimit ?? DEFAULT_BASELINE_LIMIT,
       // Change format
       ignored: Object.freeze(_opts.ignored ? arrify(_opts.ignored).map(cloneOwnedMatcher) : []),
       awaitWriteFinish:
@@ -267,8 +276,24 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       isReady: () => this.readyEmitted,
       remove: (directory, item) => this.removePath(directory, item),
       handleError: (error) => this.handleError(error),
-      publish: (event, args) => this.emitWithAll(event, args as EmitArgs),
+      publish: (event, args) => {
+        if (this.startup) {
+          this.startup.publish(event, args as EmitArgs, (publishedEvent, publishedArgs) =>
+            this.emitWithAll(publishedEvent, publishedArgs)
+          );
+        } else {
+          this.emitWithAll(event, args as EmitArgs);
+        }
+      },
     });
+    if (opts.baseline) {
+      this.startup = new StartupAdapter(opts, opts.baselineLimit);
+      this.startup.onFail = (error) => {
+        // Surface the failure before close() removes the listeners.
+        this.handleError(error);
+        void this.close();
+      };
+    }
     void this.emitRaw;
     void this.createHelper;
     void this.addPathCloser;
@@ -351,8 +376,17 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       this.readyScheduled = false;
       if (this.closed || this.readyEmitted || this.lifecycle.tasks.size > 0) return;
       this.readyPending = false;
+      // Barrier: freeze the baseline, publish it once, then open incremental
+      // delivery. Events committed after the seal are never baseline members.
+      if (this.startup) {
+        const baseline = this.startup.seal();
+        for (const entry of baseline) {
+          this.emitWithAll(entry.event, entry.args);
+        }
+      }
       this.readyEmitted = true;
       this.emit(EV.READY);
+      this.startup?.goLive();
     });
   }
 
@@ -469,6 +503,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       );
       if (failed) throw failed.reason;
     })();
+    this.startup?.close();
     return this.closePromise;
   }
 

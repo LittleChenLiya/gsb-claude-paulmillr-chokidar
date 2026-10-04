@@ -21,6 +21,7 @@ document is unclear; option semantics live in `README.md`.
 | `tree.ts`      | `LifecycleScope`, `ReconciliationQueue`, `TreeState`, `WatcherContext` port    |
 | `policy.ts`    | `EventPolicy`: atomic, awaitWriteFinish, change/remove windows, policy timers  |
 | `reconcile.ts` | `ObservationEngine`: the only subscriber, scanner, and tree-transition engine  |
+| `startup.ts`   | `StartupAdapter`: baseline collection, the `ready` barrier, startup failure    |
 | `index.ts`     | `FSWatcher`: option resolution, ignores, ready, unwatch/close, public events   |
 
 The import graph is a DAG, `runtime -> {backend, tree} -> policy -> reconcile -> index`
@@ -47,6 +48,37 @@ test seam and is not packaged.
    There is no ready counter.
 9. After any burst the final public state is truthful: an existing path is not left unlinked and
    a missing path is not left added.
+
+## Startup baseline
+
+When `baseline: true` is set, `index.ts` installs a `StartupAdapter` between `EventPolicy` and the
+public emitter. It intercepts every public event at the single `publish` choke point and moves
+through four states:
+
+```text
+buffering ──seal()──▶ sealed ──goLive()──▶ live
+    │
+    ├── fail()  ──▶ failed
+    └── close() ──▶ closed
+```
+
+- **buffering** — from `watch()` / `add()` until the initial scan settles. `add` / `addDir` are
+  merged into one baseline entry per logical path key; `change` refreshes the entry's stats;
+  `unlink` / `unlinkDir` remove it. Nothing is emitted. `error` always delivers immediately.
+- **sealed** — the `ready` barrier. `seal()` freezes the baseline and returns its entries in
+  insertion (scan) order. `index.ts` publishes them synchronously, then emits `ready`, then calls
+  `goLive()`. Events committed before the seal belong to the baseline; events committed after it
+  are increments. The commit point (not the event's start time) decides the side, so the same
+  event is never both baseline and increment.
+- **live** — after `ready`. Events pass through to the public emitter unchanged.
+- **failed** — the baseline buffer exceeded `baselineLimit` distinct paths. `fail()` drops the
+  baseline, emits an `error`, and closes the watcher. No pseudo-complete baseline is published.
+- **closed** — `close()` before `ready`. The baseline is dropped; no baseline or `ready` is
+  published.
+
+The adapter is opt-in: with `baseline: false` (the default) no adapter is installed and the
+pipeline is unchanged. The barrier is a synchronous flip inside the `ready` `nextTick`, so no
+event can interleave between the seal and the baseline publish.
 
 ## Path identities
 

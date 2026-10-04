@@ -102,6 +102,9 @@ chokidar.watch('dir-or-file', {
   // Errors and lifecycle
   ignorePermissionErrors: false,
   persistent: true,
+  // Startup baseline
+  baseline: false, // collect pre-ready adds as one baseline published at ready
+  baselineLimit: 1024, // max distinct paths held in the baseline buffer
 });
 ```
 
@@ -174,6 +177,44 @@ chokidar.watch('dir-or-file', {
   unreadable paths are suppressed instead of emitted.
 - `persistent` (default: `true`). Whether the watcher keeps the process alive while it is
   watching.
+
+#### Startup baseline
+
+- `baseline` (default: `false`). When `true`, `add` / `addDir` events from the initial scan are
+  not emitted immediately. Instead they are collected as a **baseline**: the final state of every
+  path that exists when the scan settles. Add, change, and unlink of the same path during the
+  scan merge into one entry (a change refreshes the stats, an unlink removes the path). The
+  baseline is published once, as ordinary `add` / `addDir` events, immediately before the `ready`
+  event. Events committed after the `ready` barrier are delivered as incremental events as usual.
+  This is useful when a consumer needs a single, consistent snapshot of the watched tree before
+  processing changes.
+- `baselineLimit` (default: `1024`). The maximum number of distinct paths the baseline buffer can
+  hold. If more paths are collected during the startup scan, startup fails: an `error` is emitted
+  and the watcher is closed. No pseudo-complete baseline is ever published on failure.
+
+**Startup state and failure rules.** The startup adapter moves through four states:
+
+```text
+buffering ──seal()──▶ sealed ──goLive()──▶ live
+    │
+    ├── fail()  ──▶ failed   (error emitted, watcher closed, baseline dropped)
+    └── close() ──▶ closed   (no baseline published)
+```
+
+- **Buffering** (from `watch()` / `add()` until the scan settles): initial events are merged into
+  the baseline and held. Nothing is emitted yet.
+- **Sealed** (the `ready` barrier): the baseline is frozen and published once, synchronously,
+  before `ready`. Events committed before the seal belong to the baseline; events committed after
+  it are increments. The same event is never both.
+- **Live** (after `ready`): events are delivered normally.
+- **Failed** (buffer overflow): the baseline is dropped, an `error` is emitted, and the watcher
+  is closed. No baseline is published.
+- **Closed** (early `close()` before `ready`): the baseline is dropped. No baseline or `ready` is
+  published.
+
+`error` events are always delivered immediately, even while buffering, so failures are never held
+behind the baseline. Enabling `baseline` does not change the behavior of watchers that leave it
+`false`.
 
 ### Methods
 

@@ -19,6 +19,7 @@ import * as sp from 'node:path';
 import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { promisify } from 'node:util';
 import { registerArchitectureTests } from './architecture.test.ts';
+import { registerStartupTests } from './startup.test.ts';
 import type { EmitArgs, FSWatcherEventMap } from './index.ts';
 
 import * as chokidar from './index.ts';
@@ -2506,6 +2507,7 @@ describe('chokidar', async () => {
   });
 
   registerV6Tests(testHarness);
+  registerStartupTests(testHarness);
 
   if (!isIBMi) {
     describe('fs.watch (non-polling)', runTests.bind(this, { backend: 'native' }));

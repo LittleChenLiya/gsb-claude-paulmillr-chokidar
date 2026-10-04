@@ -16,6 +16,8 @@
     "reconcile.d.ts",
     "runtime.js",
     "runtime.d.ts",
+    "startup.js",
+    "startup.d.ts",
     "tree.js",
     "tree.d.ts"
   ],
