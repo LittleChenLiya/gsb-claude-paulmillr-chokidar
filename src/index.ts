@@ -8,6 +8,12 @@ import { selectBackend } from './backend.js';
 import { EventPolicy } from './policy.js';
 import { ObservationEngine } from './reconcile.js';
 import {
+  RenameCorrelator,
+  type FileIdentity,
+  type RenameCorrelation,
+  type RenameSource,
+} from './rename.js';
+import {
   type ChokidarOptions,
   cloneOwnedMatcher,
   compileMatchers,
@@ -126,6 +132,7 @@ export interface FSWatcherEventMap {
   [EV.ADD_DIR]: EmitArgs;
   [EV.UNLINK]: EmitArgs;
   [EV.UNLINK_DIR]: EmitArgs;
+  [EV.RENAME]: [oldPath: Path, newPath: Path, stats?: Stats];
 }
 
 /**
@@ -164,6 +171,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
   private readyScheduled: boolean;
   private handler: ObservationEngine;
   private scheduler: Scheduler;
+  private renameCorrelator?: RenameCorrelator;
 
   // Not indenting methods for history sake; for now.
   constructor(_opts: ChokidarOptions = {}, scheduler: Scheduler = systemScheduler) {
@@ -207,6 +215,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       backendCapabilities: undefined as never,
       // useAsync: false,
       atomic: _opts.atomic ?? true,
+      rename: _opts.rename ?? false,
       // Change format
       ignored: Object.freeze(_opts.ignored ? arrify(_opts.ignored).map(cloneOwnedMatcher) : []),
       awaitWriteFinish:
@@ -274,6 +283,21 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
     void this.addPathCloser;
     void this.createScanStream;
     this.handler = new ObservationEngine(this as unknown as WatcherContext);
+    if (opts.rename) {
+      const window = typeof opts.rename === 'object' ? opts.rename.window : undefined;
+      this.renameCorrelator = new RenameCorrelator({
+        scheduler: this.scheduler,
+        window,
+        isActive: () => !this.closed,
+        isPathGenerationActive: (path, generation) =>
+          this.isPathGenerationActive(path, generation),
+        identityExistsElsewhere: (identity, excludePath) =>
+          this.tree.identityExistsElsewhere(identity, excludePath),
+        onRename: (correlation) => this.publishRename(correlation),
+        onUnlink: (path, source) => this.publishCorrelatedUnlink(path, source),
+        onAdd: (path, stats, source) => this.publishCorrelatedAdd(path, stats, source),
+      });
+    }
     // You’re frozen when your heart’s not open.
     Object.freeze(opts);
   }
@@ -420,6 +444,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       this.removeRootAncestors(key);
       this.pendingAdds.delete(key);
       this.events.cancelPath(key);
+      this.renameCorrelator?.cancelPath(key);
       this.closePath(key, isDirectory);
 
       this.addIgnoredPath(key);
@@ -448,6 +473,8 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
     // Memory management.
     this.removeAllListeners();
     this.events.close();
+    this.renameCorrelator?.close();
+    this.renameCorrelator = undefined;
     this.pendingAdds.clear();
     this.roots.clear();
     this.rootAncestors.clear();
@@ -505,10 +532,54 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
    * @param event Type of event
    * @param path File or directory path
    * @param stats arguments to be passed with event
+   * @param identity cached file identity for an unlink (captured before the
+   *   tree observation is dropped)
    */
-  private async emitEvent(event: EventName, path: Path, stats?: Stats): Promise<void> {
+  private async emitEvent(
+    event: EventName,
+    path: Path,
+    stats?: Stats,
+    identity?: FileIdentity
+  ): Promise<void> {
     if (this.closed) return;
+    const correlator = this.renameCorrelator;
+    if (
+      correlator &&
+      (event === EV.UNLINK ||
+        event === EV.UNLINK_DIR ||
+        event === EV.ADD ||
+        event === EV.ADD_DIR)
+    ) {
+      if (event === EV.UNLINK || event === EV.UNLINK_DIR) {
+        correlator.noteUnlink(path, identity, event);
+      } else {
+        correlator.noteAdd(path, stats, identity, event);
+      }
+      return;
+    }
     await this.events.emit(event, path, stats);
+  }
+
+  /** Publishes a correlated rename as a public event. */
+  private publishRename(correlation: RenameCorrelation): void {
+    if (this.closed) return;
+    this.emit(EV.RENAME, correlation.oldPath, correlation.newPath, correlation.stats);
+    // The rename event carries two paths + stats, more than the standard
+    // EmitArgs shape, so relay ALL through a widened, bound signature.
+    const emitAll = (this.emit as (event: string, ...args: unknown[]) => boolean).bind(this);
+    emitAll(EV.ALL, EV.RENAME, correlation.oldPath, correlation.newPath, correlation.stats);
+  }
+
+  /** Releases an unassociated unlink through the normal policy pipeline. */
+  private publishCorrelatedUnlink(path: Path, source: RenameSource): void {
+    if (this.closed) return;
+    void this.events.emit(source.event, path);
+  }
+
+  /** Releases an unassociated add through the normal policy pipeline. */
+  private publishCorrelatedAdd(path: Path, stats: Stats | undefined, source: RenameSource): void {
+    if (this.closed) return;
+    void this.events.emit(source.event, path, stats);
   }
 
   /** Common handler for backend and reconciliation failures. */
@@ -698,11 +769,18 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       suppressEvent = event === EV.ADD;
     }
 
-    // Drop the entry if what got removed was a watched directory
+    // Drop the entry if what got removed was a watched directory.
+    // Capture the cached identity before the observation is dropped so the
+    // rename correlator can match the deletion against a later add.
+    const cachedFact = this.tree.observed.get(logicalKey);
+    const identity: FileIdentity | undefined =
+      cachedFact && cachedFact.ino !== 0 ? { dev: cachedFact.dev, ino: cachedFact.ino } : undefined;
     this.tree.watched.delete(logicalKey);
-    this.tree.observed.delete(logicalKey);
+    this.tree.forgetObserved(logicalKey);
     const eventName: EventName = isDirectory ? EV.UNLINK_DIR : EV.UNLINK;
-    if (wasTracked && !suppressEvent && !this.isIgnored(path)) this.emitEvent(eventName, path);
+    if (wasTracked && !suppressEvent && !this.isIgnored(path)) {
+      this.emitEvent(eventName, path, undefined, identity);
+    }
 
     // Avoid conflicts if we later create another file with the same name
     this.closePath(path);
@@ -736,13 +814,14 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
         entry.dispose();
         this.tree.watched.delete(key);
       }
-      for (const key of this.tree.observed.keys()) {
-        if (contains(key)) this.tree.observed.delete(key);
+      for (const key of [...this.tree.observed.keys()]) {
+        if (contains(key)) this.tree.forgetObserved(key);
       }
       for (const key of this.tree.symlinkPaths.keys()) {
         if (contains(key)) this.tree.symlinkPaths.delete(key);
       }
       this.events.cancelWhere(contains);
+      this.renameCorrelator?.cancelPath(path);
       this.reconciliation.forgetPending(
         (scope, candidate) => contains(scope) || contains(candidate)
       );

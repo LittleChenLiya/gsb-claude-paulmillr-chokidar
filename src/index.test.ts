@@ -19,6 +19,7 @@ import * as sp from 'node:path';
 import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { promisify } from 'node:util';
 import { registerArchitectureTests } from './architecture.test.ts';
+import { registerRenameIntegrationTests, registerRenameTests } from './rename.test.ts';
 import type { EmitArgs, FSWatcherEventMap } from './index.ts';
 
 import * as chokidar from './index.ts';
@@ -2520,6 +2521,8 @@ describe('chokidar', async () => {
 });
 
 registerArchitectureTests(reportTestFailure);
+registerRenameTests();
+registerRenameIntegrationTests();
 
 async function main() {
   const initialPath = process.cwd();

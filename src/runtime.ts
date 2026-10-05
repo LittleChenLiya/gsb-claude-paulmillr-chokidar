@@ -66,6 +66,7 @@ export const EVENTS = {
   ADD_DIR: 'addDir',
   UNLINK: 'unlink',
   UNLINK_DIR: 'unlinkDir',
+  RENAME: 'rename',
   RAW: 'raw',
   ERROR: 'error',
 } as const;
@@ -123,6 +124,8 @@ type BasicOptions = {
   depth?: number;
   ignorePermissionErrors: boolean;
   atomic: boolean | number;
+  /** Explicit rename correlation by device + file identity. Defaults to false. */
+  rename?: boolean | { window?: number };
 };
 export type ChokidarOptions = Partial<
   BasicOptions & { ignored: Matcher | Matcher[]; awaitWriteFinish: boolean | Partial<AWF> }

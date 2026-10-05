@@ -185,6 +185,7 @@ export type ObservedPathFact = {
   size: number;
   mtimeMs: number;
   ino: number;
+  dev: number;
   kind: 'file' | 'directory' | 'symlink' | 'other';
   transition?: 'add' | 'change';
   rawEvent?: NativeTrigger['rawEvent'];
@@ -197,6 +198,7 @@ const INITIAL_OBSERVATION_FACT: ObservedPathFact = Object.freeze({
   size: 0,
   mtimeMs: 0,
   ino: 0,
+  dev: 0,
   kind: 'other',
   initialRecursive: true,
 });
@@ -275,6 +277,8 @@ export class TreeState {
   readonly observed: Map<string, ObservedPathFact> = new Map();
   readonly symlinkPaths: Map<Path, string | boolean> = new Map();
   readonly recursiveRoots: Set<string> = new Set();
+  /** Reverse identity index: identityKey -> set of logical path keys. */
+  private readonly identityPaths: Map<string, Set<string>> = new Map();
   private readonly observesNative: () => boolean;
 
   constructor(observesNative: () => boolean) {
@@ -297,6 +301,38 @@ export class TreeState {
     return this.watched.get(logicalPathKey(sp.resolve(directory)));
   }
 
+  /** Identity key for a stat, or undefined when dev/ino are unreliable. */
+  private identityKeyForStats(stats: Stats): string | undefined {
+    const { dev, ino } = stats;
+    if (typeof dev !== 'number' || typeof ino !== 'number') return undefined;
+    if (!Number.isFinite(dev) || !Number.isFinite(ino)) return undefined;
+    return `${dev}:${ino}`;
+  }
+
+  /** True when `identity` is observed at a path other than `excludePath`. */
+  identityExistsElsewhere(
+    identity: { dev: number; ino: number },
+    excludePath: Path
+  ): boolean {
+    const key = `${identity.dev}:${identity.ino}`;
+    const paths = this.identityPaths.get(key);
+    if (!paths) return false;
+    const excludeKey = logicalPathKey(excludePath);
+    for (const pathKey of paths) {
+      if (pathKey !== excludeKey) return true;
+    }
+    return false;
+  }
+
+  /** Removes a path from the reverse identity index. */
+  private removeIdentityPath(pathKey: string, identityKey: string | undefined): void {
+    if (!identityKey) return;
+    const paths = this.identityPaths.get(identityKey);
+    if (!paths) return;
+    paths.delete(pathKey);
+    if (paths.size === 0) this.identityPaths.delete(identityKey);
+  }
+
   recordObserved(
     path: Path,
     stats: Stats,
@@ -307,10 +343,15 @@ export class TreeState {
   ): void {
     if (!this.observesNative()) return;
     if (!trigger && !initialRecursive && !retainWithoutTrigger) return;
-    this.observed.set(logicalPathKey(path), {
+    const pathKey = logicalPathKey(path);
+    const previous = this.observed.get(pathKey);
+    const identityKey = this.identityKeyForStats(stats);
+    if (previous) this.removeIdentityPath(pathKey, `${previous.dev}:${previous.ino}`);
+    this.observed.set(pathKey, {
       size: stats.size,
       mtimeMs: stats.mtimeMs,
       ino: stats.ino,
+      dev: stats.dev,
       kind: statKind(stats),
       transition,
       rawEvent: trigger?.rawEvent,
@@ -318,6 +359,24 @@ export class TreeState {
       observedAt: trigger?.observedAt,
       initialRecursive,
     });
+    if (identityKey) {
+      let paths = this.identityPaths.get(identityKey);
+      if (!paths) {
+        paths = new Set();
+        this.identityPaths.set(identityKey, paths);
+      }
+      paths.add(pathKey);
+    }
+  }
+
+  /** Drops one path's observation and reverse-index entry. */
+  forgetObserved(path: Path): void {
+    const pathKey = logicalPathKey(path);
+    const previous = this.observed.get(pathKey);
+    if (previous) {
+      this.removeIdentityPath(pathKey, `${previous.dev}:${previous.ino}`);
+      this.observed.delete(pathKey);
+    }
   }
 
   consumeInitialCreate(
@@ -385,6 +444,7 @@ export class TreeState {
     this.watched.forEach((entry) => entry.dispose());
     this.watched.clear();
     this.observed.clear();
+    this.identityPaths.clear();
     this.symlinkPaths.clear();
     this.recursiveRoots.clear();
   }

@@ -99,6 +99,7 @@ chokidar.watch('dir-or-file', {
   atomic: true, // false with backend: 'polling'; or a number of ms
   awaitWriteFinish: false, // or true, or { stabilityThreshold: 2000, pollInterval: 100 }
   alwaysStat: false,
+  rename: false, // true, or { window: 100 } ms; correlate unlink/add into rename
   // Errors and lifecycle
   ignorePermissionErrors: false,
   persistent: true,
@@ -167,6 +168,12 @@ chokidar.watch('dir-or-file', {
 - `alwaysStat` (default: `false`). Always pass an
   [`fs.Stats`](https://nodejs.org/api/fs.html#class-fsstats) object with `add` / `addDir` /
   `change`, issuing an extra `stat` when the backend did not provide one.
+- `rename` (default: `false`). Explicitly correlate `unlink` then `add` into a single `rename`
+  event using the reliable device + file identity (`dev:ino`), never by name similarity. A
+  rename is synthesised only for a unique one-to-one match; an unknown identity, hard links, or
+  multiple candidates are released as the original `unlink` / `add` so no event is dropped. The
+  waiting window is 100 ms by default (`{ window: 100 }`). The `rename` event passes
+  `(oldPath, newPath, stats?)` and also appears on `all`.
 
 #### Errors and lifecycle
 
