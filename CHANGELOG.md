@@ -24,6 +24,7 @@
 
 ### Fixes
 
+- `awaitWriteFinish` now holds `add` / `change` until size, mtime, and a reliable device+inode identity have all stayed constant, not just size. A path replaced by a new file starts a fresh generation, so a late stat from the old file can never publish an event for the new one; `unlink` and `close` cancel the wait. On filesystems that report inode 0 the identity is explicitly marked unknown and the profile degrades to size+mtime instead of assuming two files are the same.
 - Fixed a 100% CPU loop when the process working directory containing a relatively watched file was deleted ([#1474](https://github.com/paulmillr/chokidar/issues/1474)).
 - Fixed watching a filesystem root, which emitted `unlink` and `unlinkDir` for every entry ([#1184](https://github.com/paulmillr/chokidar/issues/1184), [#452](https://github.com/paulmillr/chokidar/issues/452)).
 - Fixed `UNKNOWN` errors from `fs.watch` on macOS sockets, which prevented watching `/var/run` ([#1391](https://github.com/paulmillr/chokidar/issues/1391)).

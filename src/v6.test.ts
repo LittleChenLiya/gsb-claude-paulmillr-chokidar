@@ -1,7 +1,13 @@
 import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepEqual, equal, ok, throws } from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { watch as nativeWatch, unwatchFile, watchFile, type WatchListener } from 'node:fs';
+import {
+  watch as nativeWatch,
+  unwatchFile,
+  watchFile,
+  type Stats,
+  type WatchListener,
+} from 'node:fs';
 import {
   lstat,
   realpath,
@@ -712,6 +718,248 @@ export function registerV6Tests(context: TestHarness): void {
       );
       equal(internals(watcher).closers.has(internals(watcher).logicalKey(filePath)), false);
       equal(closer.callCount, 1);
+    });
+
+    describe('awaitWriteFinish stability profile', () => {
+      const fakeStats = (size: number, mtimeMs: number, ino: number, dev = 1): Stats =>
+        ({ size, mtimeMs, ino, dev }) as Stats;
+
+      const advance = (scheduler: VirtualScheduler): void => {
+        scheduler.advanceBy(10);
+      };
+
+      it('should reset the quiet window on size, mtime, or identity change and emit once', async () => {
+        await mkdir(context.currentDir, { recursive: true });
+        const filePath = dpath('profile.txt');
+        const snapshots = [
+          fakeStats(10, 100, 111), // baseline
+          fakeStats(10, 200, 111), // mtime changed
+          fakeStats(10, 200, 222), // identity changed (new file at the same path)
+          fakeStats(20, 200, 222), // size changed
+          fakeStats(20, 200, 222), // stable
+          fakeStats(20, 200, 222),
+          fakeStats(20, 200, 222),
+        ];
+        let calls = 0;
+        const stat = async (): Promise<Stats> => snapshots[calls++];
+        const scheduler = new VirtualScheduler();
+        const watcher = new chokidar.FSWatcher(
+          { awaitWriteFinish: { pollInterval: 10, stabilityThreshold: 30 } },
+          scheduler,
+          stat
+        );
+        WATCHERS.push(watcher);
+        internals(watcher).readyEmitted = true;
+        const spy = createSpy<EmitArgs, void>();
+        watcher.on(EV.ADD, spy);
+
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        for (let i = 0; i < 7; i += 1) {
+          advance(scheduler);
+          await internals(watcher).drainTasks();
+        }
+
+        equal(spy.callCount, 1);
+        const [, emittedStats] = spy.calls[0];
+        equal(emittedStats?.size, 20);
+        equal(emittedStats?.ino, 222);
+        equal(internals(watcher).pendingWrites.size, 0);
+        equal(scheduler.activeCount, 0);
+      });
+
+      it('should not trigger early on same-size mtime changes; emit once after the final quiet window', async () => {
+        await mkdir(context.currentDir, { recursive: true });
+        const filePath = dpath('mtime.txt');
+        const snapshots = [
+          fakeStats(10, 100, 111),
+          fakeStats(10, 200, 111), // same size, mtime moves
+          fakeStats(10, 300, 111), // same size, mtime moves again
+          fakeStats(10, 300, 111), // mtime settles
+          fakeStats(10, 300, 111),
+          fakeStats(10, 300, 111),
+        ];
+        let calls = 0;
+        const stat = async (): Promise<Stats> => snapshots[calls++];
+        const scheduler = new VirtualScheduler();
+        const watcher = new chokidar.FSWatcher(
+          { awaitWriteFinish: { pollInterval: 10, stabilityThreshold: 30 } },
+          scheduler,
+          stat
+        );
+        WATCHERS.push(watcher);
+        internals(watcher).readyEmitted = true;
+        const spy = createSpy<EmitArgs, void>();
+        watcher.on(EV.ADD, spy);
+
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        for (let i = 0; i < 3; i += 1) {
+          advance(scheduler);
+          await internals(watcher).drainTasks();
+        }
+        // A size-only profile would have emitted here; mtime changes hold it.
+        equal(spy.callCount, 0);
+
+        for (let i = 0; i < 3; i += 1) {
+          advance(scheduler);
+          await internals(watcher).drainTasks();
+        }
+
+        equal(spy.callCount, 1);
+        const [, emittedStats] = spy.calls[0];
+        equal(emittedStats?.mtimeMs, 300);
+        equal(internals(watcher).pendingWrites.size, 0);
+      });
+
+      it('should discard a late stat from an earlier generation after replacement', async () => {
+        await mkdir(context.currentDir, { recursive: true });
+        const filePath = dpath('generation.txt');
+        const oldStats = fakeStats(10, 100, 111);
+        const newStats = fakeStats(20, 200, 222);
+        const pending: Array<(stats: Stats) => void> = [];
+        const stat = (): Promise<Stats> =>
+          new Promise<Stats>((resolve) => {
+            pending.push(resolve);
+          });
+        const flush = async (): Promise<void> => {
+          for (let i = 0; i < 4; i += 1) await Promise.resolve();
+        };
+        const scheduler = new VirtualScheduler();
+        const watcher = new chokidar.FSWatcher(
+          { awaitWriteFinish: { pollInterval: 10, stabilityThreshold: 30 }, atomic: false },
+          scheduler,
+          stat
+        );
+        WATCHERS.push(watcher);
+        internals(watcher).readyEmitted = true;
+        const spy = createSpy<EmitArgs, void>();
+        watcher.on(EV.ADD, spy);
+        watcher.on(EV.CHANGE, spy);
+
+        // First wait: its stat is in flight when the path is replaced.
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        advance(scheduler);
+        equal(pending.length, 1);
+
+        // Unlink cancels the wait and bumps the write generation. The in-flight
+        // stat is intentionally still pending; it must be discarded on resolve.
+        await internals(watcher).emitEvent(EV.UNLINK, filePath);
+        equal(internals(watcher).pendingWrites.size, 0);
+
+        // A new file occupies the path; a new wait starts for the new generation.
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        advance(scheduler);
+        equal(pending.length, 2);
+
+        // The late stat from the old generation resolves after the new wait
+        // started: it is discarded and must not publish for the new file.
+        pending[0](oldStats);
+        await flush();
+        equal(spy.callCount, 0);
+
+        // The new generation stabilizes and emits exactly once with new stats.
+        pending[1](newStats);
+        await flush();
+        await internals(watcher).drainTasks();
+        for (let i = 0; i < 2; i += 1) {
+          advance(scheduler);
+          pending[pending.length - 1]?.(newStats);
+          await flush();
+        }
+
+        equal(spy.callCount, 1);
+        const [, emittedStats] = spy.calls[0];
+        equal(emittedStats?.size, 20);
+        equal(emittedStats?.ino, 222);
+        equal(internals(watcher).pendingWrites.size, 0);
+      });
+
+      it('should cancel the current wait on unlink', async () => {
+        await mkdir(context.currentDir, { recursive: true });
+        const filePath = dpath('cancel-unlink.txt');
+        const stat = async (): Promise<Stats> => fakeStats(10, 100, 111);
+        const scheduler = new VirtualScheduler();
+        const watcher = new chokidar.FSWatcher(
+          { awaitWriteFinish: { pollInterval: 10, stabilityThreshold: 30 }, atomic: false },
+          scheduler,
+          stat
+        );
+        WATCHERS.push(watcher);
+        internals(watcher).readyEmitted = true;
+        const spy = createSpy<EmitArgs, void>();
+        watcher.on(EV.ADD, spy);
+
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        equal(internals(watcher).pendingWrites.size, 1);
+
+        await internals(watcher).emitEvent(EV.UNLINK, filePath);
+        equal(internals(watcher).pendingWrites.size, 0);
+        equal(spy.callCount, 0);
+        equal(scheduler.activeCount, 0);
+      });
+
+      it('should cancel the current wait on close', async () => {
+        await mkdir(context.currentDir, { recursive: true });
+        const filePath = dpath('cancel-close.txt');
+        const stat = async (): Promise<Stats> => fakeStats(10, 100, 111);
+        const scheduler = new VirtualScheduler();
+        const watcher = new chokidar.FSWatcher(
+          { awaitWriteFinish: { pollInterval: 10, stabilityThreshold: 30 } },
+          scheduler,
+          stat
+        );
+        WATCHERS.push(watcher);
+        internals(watcher).readyEmitted = true;
+
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        equal(internals(watcher).pendingWrites.size, 1);
+
+        await watcher.close();
+        equal(internals(watcher).pendingWrites.size, 0);
+        equal(scheduler.activeCount, 0);
+      });
+
+      it('should mark unknown identity and degrade to size+mtime instead of assuming sameness', async () => {
+        await mkdir(context.currentDir, { recursive: true });
+        const filePath = dpath('degraded.txt');
+        const snapshots = [
+          fakeStats(10, 100, 0), // identity unavailable
+          fakeStats(10, 200, 0), // mtime still moves -> window resets
+          fakeStats(10, 200, 0), // size+mtime settle
+          fakeStats(10, 200, 0),
+          fakeStats(10, 200, 0),
+        ];
+        let calls = 0;
+        const stat = async (): Promise<Stats> => snapshots[calls++];
+        const scheduler = new VirtualScheduler();
+        const watcher = new chokidar.FSWatcher(
+          { awaitWriteFinish: { pollInterval: 10, stabilityThreshold: 30 } },
+          scheduler,
+          stat
+        );
+        WATCHERS.push(watcher);
+        internals(watcher).readyEmitted = true;
+        const spy = createSpy<EmitArgs, void>();
+        watcher.on(EV.ADD, spy);
+
+        await internals(watcher).emitEvent(EV.ADD, filePath);
+        advance(scheduler);
+        await internals(watcher).drainTasks();
+        const pending = internals(watcher).pendingWrites.get(
+          internals(watcher).logicalKey(filePath)
+        );
+        // The unknown identity is explicitly marked, never assumed equal.
+        equal(pending?.snapshot?.identity.reliable, false);
+
+        for (let i = 0; i < 4; i += 1) {
+          advance(scheduler);
+          await internals(watcher).drainTasks();
+        }
+
+        equal(spy.callCount, 1);
+        const [, emittedStats] = spy.calls[0];
+        equal(emittedStats?.size, 10);
+        equal(internals(watcher).pendingWrites.size, 0);
+      });
     });
 
     it('should await tasks and closers handed off after close starts', async () => {

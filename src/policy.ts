@@ -1,5 +1,4 @@
 import type { Stats } from 'node:fs';
-import { stat } from 'node:fs/promises';
 import * as sp from 'node:path';
 import {
   EVENTS,
@@ -20,7 +19,35 @@ import {
 } from './runtime.js';
 import { LifecycleScope } from './tree.js';
 
-export type PendingWrite = { lastChange: number; cancelWait: () => EventName };
+/**
+ * File identity used by awaitWriteFinish to tell successive polls apart.
+ *
+ * `reliable: true` carries the platform's device+inode pair, which uniquely
+ * identifies a file within a filesystem. `reliable: false` marks a stat that
+ * could not provide one (some network / virtual filesystems report inode 0);
+ * callers must never silently assume such a file is the same one across polls.
+ */
+export type FileIdentity =
+  | { readonly reliable: true; readonly key: string }
+  | { readonly reliable: false };
+
+/**
+ * Explicit stability profile captured on every awaitWriteFinish poll.
+ * Size, mtime, and a reliable identity each independently reset the quiet
+ * window; no single field is trusted on its own.
+ */
+export type StabilitySnapshot = {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly identity: FileIdentity;
+};
+
+export type PendingWrite = {
+  lastChange: number;
+  generation: number;
+  snapshot?: StabilitySnapshot;
+  cancelWait: () => EventName;
+};
 export type PendingChangeEmission = {
   path: Path;
   stats?: Stats;
@@ -38,7 +65,41 @@ type EventPolicyContext = {
   remove: (directory: string, item: string) => void;
   handleError: (error: Error) => void;
   publish: (event: EventName, args: EmitArgs | EmitErrorArgs) => void;
+  stat: (path: Path) => Promise<Stats>;
 };
+
+function identityOf(stats: Stats): FileIdentity {
+  // Node reports inode 0 when the platform cannot provide one (some network
+  // and virtual filesystems). Mark that explicitly instead of treating two
+  // unknown identities as the same file.
+  if (stats.ino === 0) return { reliable: false };
+  return { reliable: true, key: `${stats.dev}:${stats.ino}` };
+}
+
+function snapshotOf(stats: Stats): StabilitySnapshot {
+  return { size: stats.size, mtimeMs: stats.mtimeMs, identity: identityOf(stats) };
+}
+
+/**
+ * Two snapshots are equal only when size, mtime, and a *reliable* identity all
+ * match. When identity is unreliable on either side it can never be the thing
+ * that proves sameness; the caller degrades to size+mtime in that case.
+ */
+function sameStabilitySnapshot(
+  left: StabilitySnapshot | undefined,
+  right: StabilitySnapshot | undefined
+): boolean {
+  if (!left || !right) return false;
+  if (left.size !== right.size) return false;
+  if (left.mtimeMs !== right.mtimeMs) return false;
+  if (left.identity.reliable && right.identity.reliable) {
+    return left.identity.key === right.identity.key;
+  }
+  // Degraded mode: without a reliable identity we cannot confirm the file is
+  // the same one, but size+mtime staying constant is the best available
+  // guarantee. The unreliable marker is explicit so this branch is never silent.
+  return true;
+}
 
 function sameChangeStats(left: Stats | undefined, right: Stats | undefined): boolean {
   return (
@@ -57,10 +118,30 @@ export class EventPolicy {
     new Map();
   readonly pendingChanges: Map<string, PendingChangeEmission> = new Map();
   readonly throttled: Map<ThrottleType, Map<string, Throttler>> = new Map();
+  /**
+   * Per-path write generations. A new generation starts whenever a path is
+   * replaced (unlink / close / unwatch). Late stats captured for an earlier
+   * generation can never publish events for the file that now occupies the path.
+   */
+  private readonly writeGenerations: Map<LogicalPathKey, number> = new Map();
   private readonly context: EventPolicyContext;
 
   constructor(context: EventPolicyContext) {
     this.context = context;
+  }
+
+  private currentWriteGeneration(key: LogicalPathKey): number {
+    return this.writeGenerations.get(key) ?? 0;
+  }
+
+  private bumpWriteGeneration(key: LogicalPathKey): number {
+    const generation = this.currentWriteGeneration(key) + 1;
+    this.writeGenerations.set(key, generation);
+    return generation;
+  }
+
+  private isWriteGenerationActive(key: LogicalPathKey, generation: number): boolean {
+    return this.currentWriteGeneration(key) === generation;
   }
 
   private setTimeout(callback: () => void, delay: number): SchedulerTimer {
@@ -85,6 +166,9 @@ export class EventPolicy {
     if (event === EVENTS.UNLINK || event === EVENTS.UNLINK_DIR) {
       this.pendingChanges.delete(logicalKey);
       this.throttled.get(EVENTS.CHANGE)?.get(logicalKey)?.clear(false);
+      // An unlinked file is gone: any in-flight wait for it must not emit once
+      // a new file occupies the path. Bump the generation and cancel the wait.
+      this.cancelPendingWrite(logicalKey);
     }
 
     const awf = options.awaitWriteFinish;
@@ -170,7 +254,7 @@ export class EventPolicy {
     ) {
       const fullPath = options.cwd ? sp.join(options.cwd, path) : path;
       try {
-        stats = await stat(fullPath);
+        stats = await this.context.stat(fullPath);
       } catch (error) {
         this.context.handleError(error as Error);
       }
@@ -236,15 +320,23 @@ export class EventPolicy {
       fullPath = sp.join(this.context.options.cwd, path);
     }
     const writeKey = logicalKey ?? logicalPathKey(fullPath);
-    const generation = this.context.lifecycle.generation;
+    const lifecycleGeneration = this.context.lifecycle.generation;
+    // Capture the current write generation. An unlink / close / unwatch that
+    // lands before a late stat resolves bumps it, so the stale continuation
+    // below can never publish an event for the file that now occupies the path.
+    const generation = this.currentWriteGeneration(writeKey);
 
-    const inspect = (previous?: Stats): void => {
+    const inspect = (): void => {
       const task = (async () => {
         let current: Stats;
         try {
-          current = await stat(fullPath);
+          current = await this.context.stat(fullPath);
         } catch (error) {
-          if (!this.context.lifecycle.isActive(generation) || !this.pendingWrites.has(writeKey)) {
+          if (
+            !this.context.lifecycle.isActive(lifecycleGeneration) ||
+            !this.isWriteGenerationActive(writeKey, generation) ||
+            !this.pendingWrites.has(writeKey)
+          ) {
             return;
           }
           if (isMissingError(error)) {
@@ -256,18 +348,29 @@ export class EventPolicy {
           return;
         }
 
-        if (!this.context.lifecycle.isActive(generation) || !this.pendingWrites.has(writeKey)) {
+        if (
+          !this.context.lifecycle.isActive(lifecycleGeneration) ||
+          !this.isWriteGenerationActive(writeKey, generation) ||
+          !this.pendingWrites.has(writeKey)
+        ) {
           return;
         }
-        const now = this.context.scheduler.now();
         const pending = this.pendingWrites.get(writeKey);
         if (!pending) return;
-        if (previous && current.size !== previous.size) pending.lastChange = now;
+        const now = this.context.scheduler.now();
+        const snapshot = snapshotOf(current);
+        // Size, mtime, and a reliable identity each independently reset the
+        // quiet window; a change in any one means the file is still moving.
+        // The first poll only establishes the baseline, it never resets.
+        if (pending.snapshot !== undefined && !sameStabilitySnapshot(pending.snapshot, snapshot)) {
+          pending.lastChange = now;
+        }
+        pending.snapshot = snapshot;
         if (now - pending.lastChange >= threshold) {
           this.pendingWrites.delete(writeKey);
           awfEmit(undefined, current);
         } else {
-          timeoutHandler = this.setTimeout(() => inspect(current), pollInterval);
+          timeoutHandler = this.setTimeout(inspect, pollInterval);
         }
       })();
       this.context.lifecycle.track(task);
@@ -276,6 +379,7 @@ export class EventPolicy {
     if (!this.pendingWrites.has(writeKey)) {
       this.pendingWrites.set(writeKey, {
         lastChange: this.context.scheduler.now(),
+        generation,
         cancelWait: () => {
           this.pendingWrites.delete(writeKey);
           this.context.scheduler.clearTimeout(timeoutHandler);
@@ -286,6 +390,12 @@ export class EventPolicy {
     }
   }
 
+  /** Cancels the current wait for a path and invalidates its write generation. */
+  private cancelPendingWrite(key: LogicalPathKey): void {
+    this.pendingWrites.get(key)?.cancelWait();
+    this.bumpWriteGeneration(key);
+  }
+
   cancelPath(path: Path): void {
     const logicalKey = logicalPathKey(path);
     const pendingUnlink = this.pendingUnlinks.get(logicalKey);
@@ -293,7 +403,7 @@ export class EventPolicy {
       this.context.scheduler.clearTimeout(pendingUnlink.timer);
       this.pendingUnlinks.delete(logicalKey);
     }
-    this.pendingWrites.get(logicalKey)?.cancelWait();
+    this.cancelPendingWrite(logicalKey);
     this.pendingChanges.delete(logicalKey);
     (['watch', 'add', 'remove', 'change'] as const).forEach((actionType) => {
       this.throttled.get(actionType)?.get(logicalKey)?.clear(false);
@@ -321,6 +431,7 @@ export class EventPolicy {
 
   close(): void {
     this.pendingWrites.forEach((pending) => pending.cancelWait());
+    this.writeGenerations.clear();
     this.pendingUnlinks.forEach(({ timer }) => this.context.scheduler.clearTimeout(timer));
     this.pendingUnlinks.clear();
     this.pendingChanges.clear();

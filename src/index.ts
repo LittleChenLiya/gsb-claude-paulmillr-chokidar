@@ -1,7 +1,7 @@
 /*! chokidar - MIT License (c) 2012 Paul Miller (paulmillr.com) */
 import { EventEmitter } from 'node:events';
 import { realpathSync, type Stats } from 'node:fs';
-import { readdir } from 'node:fs/promises';
+import { readdir, stat as statImpl } from 'node:fs/promises';
 import * as sp from 'node:path';
 import { readdirp, type ReaddirpOptions, ReaddirpStream } from 'readdirp';
 import { selectBackend } from './backend.js';
@@ -166,7 +166,11 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
   private scheduler: Scheduler;
 
   // Not indenting methods for history sake; for now.
-  constructor(_opts: ChokidarOptions = {}, scheduler: Scheduler = systemScheduler) {
+  constructor(
+    _opts: ChokidarOptions = {},
+    scheduler: Scheduler = systemScheduler,
+    stat: (path: string) => Promise<Stats> = statImpl
+  ) {
     super();
 
     if (_opts.backend !== undefined && !WATCH_BACKENDS.has(_opts.backend)) {
@@ -268,6 +272,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       remove: (directory, item) => this.removePath(directory, item),
       handleError: (error) => this.handleError(error),
       publish: (event, args) => this.emitWithAll(event, args as EmitArgs),
+      stat,
     });
     void this.emitRaw;
     void this.createHelper;

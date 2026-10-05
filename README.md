@@ -161,9 +161,14 @@ chokidar.watch('dir-or-file', {
 - `awaitWriteFinish` (default: `false`). By default `add` / `change` fire as soon as a file
   appears or changes, which for large or chunked writes can be before the write is finished.
   Set to `true` (or `{ stabilityThreshold: 2000, pollInterval: 100 }`) to hold `add` / `change`
-  until the file size has stayed constant for `stabilityThreshold` ms, checked every
-  `pollInterval` ms. The right threshold depends on the OS and hardware: higher is safer and less
-  responsive. Events from the initial scan are not held.
+  until the file's size, mtime, and (when the platform provides one) device+inode identity have
+  stayed constant for `stabilityThreshold` ms, checked every `pollInterval` ms. Any change to
+  size, mtime, or a reliable identity resets the quiet window; paths replaced by a new file start
+  a fresh generation so a late stat can never publish an event for the new file, and `unlink` /
+  `close` cancel the wait. On filesystems that report inode 0 the identity is explicitly marked
+  unknown and the profile degrades to size+mtime rather than assuming two files are the same.
+  The right threshold depends on the OS and hardware: higher is safer and less responsive.
+  Events from the initial scan are not held.
 - `alwaysStat` (default: `false`). Always pass an
   [`fs.Stats`](https://nodejs.org/api/fs.html#class-fsstats) object with `add` / `addDir` /
   `change`, issuing an extra `stat` when the backend did not provide one.
