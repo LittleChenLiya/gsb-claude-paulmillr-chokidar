@@ -14,6 +14,8 @@
     "policy.d.ts",
     "reconcile.js",
     "reconcile.d.ts",
+    "rename.js",
+    "rename.d.ts",
     "runtime.js",
     "runtime.d.ts",
     "tree.js",
@@ -50,6 +52,8 @@
     "build": "tsc",
     "format": "prettier --write src benchmark scripts .github/funding.yml .github/workflows package.json README.md",
     "test": "node index.test.js",
+    "test:rename": "node rename.test.js",
+    "example:rename": "node scripts/fake-watcher.mjs",
     "benchmark": "node benchmark/bench.mjs",
     "test:bun1": "bun index.test.js",
     "test:vms": "node scripts/test-vms.mjs"

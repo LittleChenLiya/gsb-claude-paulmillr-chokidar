@@ -12,6 +12,7 @@
 
 ### API changes
 
+- Added the explicit rename correlator (`rename.js`, `RenameCorrelator`). It synthesizes `rename` events only from a unique device+file-ID match between a pending `unlink` and a pending `add`, never from name similarity. Deletion identities come from the live-path stat cache, late asynchronous add stats are validated against the path generation, hard-link or multi-candidate clashes are only marked `uncertain`, unknown identities are never force-merged, and unmatched events flush unchanged after an injected-clock wait window with their original sources attached. See `scripts/fake-watcher.mjs` for a runnable five-event example.
 - Added the `backend` option: `'auto'` (default), `'native'`, `'native-recursive'`, or `'polling'`.
   - `usePolling: true` remains as a deprecated alias for `backend: 'polling'`.
 - Renamed `interval` and `binaryInterval` to `pollingInterval` and `pollingBinaryInterval`.

@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { promisify } from 'node:util';
 import { registerArchitectureTests } from './architecture.test.ts';
 import type { EmitArgs, FSWatcherEventMap } from './index.ts';
+import './rename.test.ts';
 
 import * as chokidar from './index.ts';
 import { EVENTS as EV, isIBMi, isMacos, isWindows } from './runtime.ts';
