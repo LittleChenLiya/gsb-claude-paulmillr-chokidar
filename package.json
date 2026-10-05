@@ -50,6 +50,7 @@
     "build": "tsc",
     "format": "prettier --write src benchmark scripts .github/funding.yml .github/workflows package.json README.md",
     "test": "node index.test.js",
+    "test:awf": "npm run build && node --test awf-profile.test.js",
     "benchmark": "node benchmark/bench.mjs",
     "test:bun1": "bun index.test.js",
     "test:vms": "node scripts/test-vms.mjs"

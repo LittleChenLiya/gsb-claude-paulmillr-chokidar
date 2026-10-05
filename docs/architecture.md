@@ -135,10 +135,33 @@ closed/path-generation check -> Windows/cwd presentation -> pending write bump
 ```
 
 - Await-write-finish starts only after `ready`.
+- Await-write-finish compares an explicit stability profile (`size`, `mtimeMs`, and the reliable
+  file identity `dev`+`ino`) between polls; any change resets the quiet window, so same-size
+  writes that only move mtime still delay the event. The default size policy is unchanged: a size
+  change resets the window exactly as before. When the filesystem reports no real inode
+  (`ino` of `0`), the identity is `unknown`: the guarantee degrades to size+mtime instead of
+  assuming the same file, and the recorded `StabilityReport` marks `identityKnown: false`.
+- Replacing the path with a new file opens a new pending-write generation (a fresh `add`, or a
+  reliable identity change between polls). A stat of the old file that resolves late is discarded
+  and can never publish the new path's event. `unlink`/`unlinkDir` and `close()` cancel the wait
+  immediately.
 - The change window replays the newest differing stats once when it closes.
 - `removePath` has a 100 ms `remove` gate so concurrent removal paths cannot double-emit.
 - `alwaysStat` fills missing stats; a stat failure suppresses that event and reports the error.
 - The `readdir`/`watch`/`add` throttle types are legacy: queue coalescing replaced them.
+
+The await-write-finish acceptance tests are Node-targeted and fully deterministic (injected clock
+and `stat`, no real files):
+
+```sh
+npm run build && node --test awf-profile.test.js   # or: npm run test:awf
+```
+
+Four-snapshot example (`pollInterval: 50`, `stabilityThreshold: 100`): the injected `stat`
+returns S1 `(size 10, mtime 100)`, S2 `(size 10, mtime 200)`, S3 `(size 10, mtime 300)`,
+S4 `(size 10, mtime 300)` at t=50/100/150/200. The same-size mtime moves at S2 and S3 each reset
+the quiet window, so nothing fires at t=200; the event fires exactly once at t=250, after the
+final quiet window (150..250) completes.
 
 ## Ignores, depth, and symlinks
 

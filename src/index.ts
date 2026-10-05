@@ -29,6 +29,7 @@ import {
   normalizePath,
   type Path,
   type Scheduler,
+  type StatFile,
   systemScheduler,
   type WatchBackend,
   type WatchHandlers,
@@ -49,10 +50,12 @@ export type {
   MatchFunction,
   Scheduler,
   SchedulerTimer,
+  StatFile,
   Throttler,
   ThrottleType,
   WatchBackend,
 } from './runtime.js';
+export type { FileIdentity, StabilityProfile, StabilityReport } from './policy.js';
 
 const DOT_RE = /\..*\.(sw[px])$|~$|\.subl.*\.tmp/;
 const WATCH_BACKENDS = new Set<WatchBackend>(['auto', 'native', 'native-recursive', 'polling']);
@@ -164,9 +167,14 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
   private readyScheduled: boolean;
   private handler: ObservationEngine;
   private scheduler: Scheduler;
+  private statFile?: StatFile;
 
   // Not indenting methods for history sake; for now.
-  constructor(_opts: ChokidarOptions = {}, scheduler: Scheduler = systemScheduler) {
+  constructor(
+    _opts: ChokidarOptions = {},
+    scheduler: Scheduler = systemScheduler,
+    statFile?: StatFile
+  ) {
     super();
 
     if (_opts.backend !== undefined && !WATCH_BACKENDS.has(_opts.backend)) {
@@ -186,6 +194,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
     this.readyPending = false;
     this.readyScheduled = false;
     this.scheduler = scheduler;
+    this.statFile = statFile;
     const awf = _opts.awaitWriteFinish;
     const opts: FSWInstanceOptions = {
       ..._opts,
@@ -261,6 +270,7 @@ export class FSWatcher extends EventEmitter<FSWatcherEventMap> {
       options: this.options,
       scheduler: this.scheduler,
       lifecycle: this.lifecycle,
+      statFile: this.statFile,
       isClosed: () => this.closed,
       capturePathGeneration: () => this.capturePathGeneration(),
       isPathGenerationActive: (path, generation) => this.isPathGenerationActive(path, generation),

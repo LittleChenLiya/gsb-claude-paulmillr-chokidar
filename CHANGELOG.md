@@ -35,6 +35,7 @@
 - Fixed replacing a watched directory with a file of the same name hanging the process ([#1464](https://github.com/paulmillr/chokidar/issues/1464)).
 - Fixed persistent watching stopping after a watched directory was removed ([#1463](https://github.com/paulmillr/chokidar/issues/1463)).
 - Fixed event throttling discarding updates; the newest differing change is now replayed when the window closes ([#1455](https://github.com/paulmillr/chokidar/issues/1455)).
+- Gave `awaitWriteFinish` an explicit stability profile: `size`, `mtime`, and the reliable file identity (`dev`+`ino`) each reset the quiet window, so same-size writes that only move mtime no longer fire early. Replacing the path with a new file opens a new generation and late stats of the old file are discarded; `unlink` and `close()` cancel the wait. When the filesystem reports no reliable identity, the guarantee degrades to size+mtime and the recorded stability report marks the identity as unknown instead of assuming the same file.
 - Fixed relative `ignored` paths; relative strings now resolve against `cwd` or the process working directory ([#1436](https://github.com/paulmillr/chokidar/issues/1436)).
 - Fixed files not being detected when their directory did not exist before watching ([#1422](https://github.com/paulmillr/chokidar/issues/1422)).
 - Fixed removed files being reported as `unlinkDir` instead of `unlink` ([#1421](https://github.com/paulmillr/chokidar/issues/1421)).

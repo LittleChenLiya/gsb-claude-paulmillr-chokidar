@@ -15,22 +15,96 @@ import {
   type Path,
   type Scheduler,
   type SchedulerTimer,
+  type StatFile,
   type Throttler,
   type ThrottleType,
 } from './runtime.js';
 import { LifecycleScope } from './tree.js';
 
-export type PendingWrite = { lastChange: number; cancelWait: () => EventName };
+/**
+ * Reliable file identity, derived from `dev`+`ino`. Filesystems that do not
+ * report a real inode (ino of 0 or non-finite) yield `{ kind: 'unknown' }`:
+ * the same-file guarantee then degrades to size+mtime instead of assuming
+ * the file is unchanged.
+ */
+export type FileIdentity =
+  | { readonly kind: 'reliable'; readonly dev: number; readonly ino: number }
+  | { readonly kind: 'unknown' };
+
+/** Explicit stability profile: any field change resets the quiet window. */
+export type StabilityProfile = {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly identity: FileIdentity;
+};
+
+/** Recorded when an awaitWriteFinish wait publishes, for inspection. */
+export type StabilityReport = {
+  readonly profile: StabilityProfile;
+  /** False when the filesystem gave no reliable identity (degraded guarantee). */
+  readonly identityKnown: boolean;
+  /** How many file replacements were observed while waiting. */
+  readonly generations: number;
+};
+
+export type PendingWrite = {
+  lastChange: number;
+  /** Bumped every time the path is replaced by a new file. */
+  generation: number;
+  /** Last reliably observed identity; `unknown` until one is seen. */
+  identity: FileIdentity;
+  cancelWait: () => EventName;
+};
 export type PendingChangeEmission = {
   path: Path;
   stats?: Stats;
   replay: boolean;
 };
 
+const UNKNOWN_IDENTITY: FileIdentity = Object.freeze({ kind: 'unknown' });
+
+/** Identity is reliable only when the filesystem reports a real inode. */
+export function fileIdentityOf(stats: Stats): FileIdentity {
+  const { dev, ino } = stats;
+  if (!Number.isFinite(dev) || !Number.isFinite(ino) || ino === 0) return UNKNOWN_IDENTITY;
+  return { kind: 'reliable', dev, ino };
+}
+
+export function stabilityProfileOf(stats: Stats): StabilityProfile {
+  return { size: stats.size, mtimeMs: stats.mtimeMs, identity: fileIdentityOf(stats) };
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  if (left.kind === 'reliable' && right.kind === 'reliable') {
+    return left.dev === right.dev && left.ino === right.ino;
+  }
+  // Unknown identity cannot prove sameness; degrade to size+mtime comparison
+  // instead of assuming both snapshots are the same file.
+  return true;
+}
+
+export function sameStabilityProfile(left: StabilityProfile, right: StabilityProfile): boolean {
+  return (
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    sameIdentity(left.identity, right.identity)
+  );
+}
+
+/** True only when both sides reliably identify two different files. */
+export function isFileReplacement(before: FileIdentity, after: FileIdentity): boolean {
+  return (
+    before.kind === 'reliable' &&
+    after.kind === 'reliable' &&
+    (before.dev !== after.dev || before.ino !== after.ino)
+  );
+}
+
 type EventPolicyContext = {
   options: FSWInstanceOptions;
   scheduler: Scheduler;
   lifecycle: LifecycleScope;
+  statFile?: StatFile;
   isClosed: () => boolean;
   capturePathGeneration: () => number;
   isPathGenerationActive: (path: Path, generation: number) => boolean;
@@ -57,10 +131,24 @@ export class EventPolicy {
     new Map();
   readonly pendingChanges: Map<string, PendingChangeEmission> = new Map();
   readonly throttled: Map<ThrottleType, Map<string, Throttler>> = new Map();
+  readonly stabilityReports: Map<string, StabilityReport> = new Map();
   private readonly context: EventPolicyContext;
 
   constructor(context: EventPolicyContext) {
     this.context = context;
+  }
+
+  private statFile(path: Path): Promise<Stats> {
+    return (this.context.statFile ?? stat)(path);
+  }
+
+  private recordStabilityReport(key: string, report: StabilityReport): void {
+    // Diagnostic seam: keep the map bounded on long-running watchers.
+    if (!this.stabilityReports.has(key) && this.stabilityReports.size >= 1024) {
+      const oldest = this.stabilityReports.keys().next().value;
+      if (oldest !== undefined) this.stabilityReports.delete(oldest);
+    }
+    this.stabilityReports.set(key, report);
   }
 
   private setTimeout(callback: () => void, delay: number): SchedulerTimer {
@@ -90,8 +178,19 @@ export class EventPolicy {
     const awf = options.awaitWriteFinish;
     const pendingWrite = awf ? this.pendingWrites.get(logicalKey) : undefined;
     if (pendingWrite) {
-      pendingWrite.lastChange = scheduler.now();
-      return;
+      if (event === EVENTS.UNLINK || event === EVENTS.UNLINK_DIR) {
+        // Deleting the path cancels the wait immediately; the unlink flows on.
+        pendingWrite.cancelWait();
+      } else {
+        if (event === EVENTS.ADD) {
+          // The path was replaced by a new file: open a new generation so a
+          // late stat of the previous file cannot publish this path's event.
+          pendingWrite.generation += 1;
+          pendingWrite.identity = UNKNOWN_IDENTITY;
+        }
+        pendingWrite.lastChange = scheduler.now();
+        return;
+      }
     }
 
     if (options.atomic) {
@@ -170,7 +269,7 @@ export class EventPolicy {
     ) {
       const fullPath = options.cwd ? sp.join(options.cwd, path) : path;
       try {
-        stats = await stat(fullPath);
+        stats = await this.statFile(fullPath);
       } catch (error) {
         this.context.handleError(error as Error);
       }
@@ -238,11 +337,14 @@ export class EventPolicy {
     const writeKey = logicalKey ?? logicalPathKey(fullPath);
     const generation = this.context.lifecycle.generation;
 
-    const inspect = (previous?: Stats): void => {
+    const inspect = (previous?: StabilityProfile): void => {
+      const pendingAtStart = this.pendingWrites.get(writeKey);
+      if (!pendingAtStart) return;
+      const pendingGeneration = pendingAtStart.generation;
       const task = (async () => {
         let current: Stats;
         try {
-          current = await stat(fullPath);
+          current = await this.statFile(fullPath);
         } catch (error) {
           if (!this.context.lifecycle.isActive(generation) || !this.pendingWrites.has(writeKey)) {
             return;
@@ -256,18 +358,38 @@ export class EventPolicy {
           return;
         }
 
-        if (!this.context.lifecycle.isActive(generation) || !this.pendingWrites.has(writeKey)) {
+        if (!this.context.lifecycle.isActive(generation)) return;
+        const pending = this.pendingWrites.get(writeKey);
+        if (!pending) return;
+        if (pending.generation !== pendingGeneration) {
+          // The path was replaced while this stat was in flight: the result
+          // belongs to the old generation and must not compare or publish.
+          timeoutHandler = this.setTimeout(() => inspect(previous), pollInterval);
           return;
         }
         const now = this.context.scheduler.now();
-        const pending = this.pendingWrites.get(writeKey);
-        if (!pending) return;
-        if (previous && current.size !== previous.size) pending.lastChange = now;
+        const profile = stabilityProfileOf(current);
+        if (previous && !sameStabilityProfile(previous, profile)) {
+          // size, mtime, or reliable identity moved: reset the quiet window.
+          pending.lastChange = now;
+        }
+        if (isFileReplacement(pending.identity, profile.identity)) {
+          // A new file sits at the path: open a new generation so late stats
+          // of the previous file are discarded, and restart the quiet window.
+          pending.generation += 1;
+          pending.lastChange = now;
+        }
+        if (profile.identity.kind === 'reliable') pending.identity = profile.identity;
         if (now - pending.lastChange >= threshold) {
           this.pendingWrites.delete(writeKey);
+          this.recordStabilityReport(writeKey, {
+            profile,
+            identityKnown: profile.identity.kind === 'reliable',
+            generations: pending.generation,
+          });
           awfEmit(undefined, current);
         } else {
-          timeoutHandler = this.setTimeout(() => inspect(current), pollInterval);
+          timeoutHandler = this.setTimeout(() => inspect(profile), pollInterval);
         }
       })();
       this.context.lifecycle.track(task);
@@ -276,6 +398,8 @@ export class EventPolicy {
     if (!this.pendingWrites.has(writeKey)) {
       this.pendingWrites.set(writeKey, {
         lastChange: this.context.scheduler.now(),
+        generation: 0,
+        identity: UNKNOWN_IDENTITY,
         cancelWait: () => {
           this.pendingWrites.delete(writeKey);
           this.context.scheduler.clearTimeout(timeoutHandler);

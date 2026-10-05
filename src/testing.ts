@@ -80,6 +80,7 @@ export type WatcherInternals = {
   pendingWrites: EventPolicy['pendingWrites'];
   pendingUnlinks: EventPolicy['pendingUnlinks'];
   pendingChangeEmissions: EventPolicy['pendingChanges'];
+  stabilityReports: EventPolicy['stabilityReports'];
   throttled: Map<ThrottleType, Map<string, Throttler>>;
   handler: ObservationEngine;
   scheduler: Scheduler;
@@ -167,6 +168,7 @@ export function inspectWatcher(watcher: FSWatcher): WatcherInternals {
     pendingWrites: events.pendingWrites,
     pendingUnlinks: events.pendingUnlinks,
     pendingChangeEmissions: events.pendingChanges,
+    stabilityReports: events.stabilityReports,
     throttled: events.throttled as Map<ThrottleType, Map<string, Throttler>>,
     handler: internal.handler,
     scheduler: internal.scheduler,

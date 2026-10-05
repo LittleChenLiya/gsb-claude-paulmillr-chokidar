@@ -54,6 +54,9 @@ export const systemScheduler: Scheduler = Object.freeze({
   },
 });
 
+/** Injectable `stat` source; defaults to `fs/promises.stat`. */
+export type StatFile = (path: string) => Promise<Stats>;
+
 export type Path = string;
 export type LogicalPathKey = string & { readonly __logicalPathKey: unique symbol };
 export type BackendResourceKey = string & { readonly __backendResourceKey: unique symbol };
